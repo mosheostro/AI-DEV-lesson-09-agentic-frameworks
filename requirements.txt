@@ -1,0 +1,16 @@
+# Lesson 9 — Agentic Frameworks (LangChain & LangGraph)
+# Standalone: everything this lab needs.
+boto3                     # Bedrock access (via langchain-aws); the shared server's Titan embeddings
+python-dotenv             # load the shared .env
+mcp<2                     # MCP SDK — pinned to 1.x because langchain-mcp-adapters does not
+                          # support mcp 2.0 yet. This pin is why the whole course is still on
+                          # the 1.x SDK: adopting a framework capped the SDK we may use.
+                          # That trade is homework task 1.
+faiss-cpu                 # local vector index for the server's knowledge-base tool
+numpy                     # vector math for FAISS
+pydantic                  # structured outputs in the chain (Ex1) and the supervisor's planner (Ex4)
+langchain                 # create_agent + LCEL chains
+langchain-aws             # ChatBedrockConverse — LangChain's wrapper over the Bedrock Converse API
+langgraph                 # StateGraph, checkpointer/interrupt, Send — the graph exercises
+langgraph-checkpoint-sqlite==3.1.2  # AsyncSqliteSaver: the supervisor CLI's approval pause survives a restart
+langchain-mcp-adapters    # load the MCP server's tools as LangChain tools (the framework-neutral seam)

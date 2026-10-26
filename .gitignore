@@ -1,0 +1,39 @@
+# Local credentials — never commit. Only the placeholder template is tracked.
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Python caches and test/coverage output
+__pycache__/
+*.py[cod]
+.coverage
+.coverage.*
+htmlcov/
+
+# LangGraph SQLite checkpoints written by supervisor.py (WAL mode adds -wal/-shm)
+checkpoints.sqlite
+checkpoints.sqlite-wal
+checkpoints.sqlite-shm
+checkpoints.sqlite-journal
+
+# Logs, captured output and temporary files
+*.log
+NULL
+*.tmp
+tmp/
+
+# Backups (the original course README backup held a credential)
+*.bak
+*.orig
+*~
+.README.orig.md
+
+# Editor and OS state
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
