@@ -42,6 +42,8 @@ aiosqlite 0.22.1.
 | 14 | Specialists never read a substring match as the requested software: the records prompt reports seat status only for an exact `system_name` row, the eligibility prompt names the software as written, and an `ExactNameLookups` tool-call middleware prefixes every `check_software_subscription` result that has no exact-name row with `NO EXACT MATCH for '<name>'; these rows are substring matches only (unconfirmed candidates, not '<name>'): <rows>.` | Observed live: "Mail" was reported as "access to Mail via the MailGuard subscription" and once as "matches MailGuard exactly"; prompts alone did not hold in 5 live runs. | The final reply (from `act` when nothing is proposed) can still suggest a candidate — §13 risk 7. |
 | 15 | When a name has no exact system, the employee's answer is a fixed text written by code (§4 "Answer rules"), never the model's: no candidate row is named and nothing is offered. | Live ("for emploees E013, add AI license x 2", and "AI"/"Mail" runs): replies named MailGuard as "the only partial match" and offered to file for it, in 3 of 3 and 4 of 5 runs, although every finding marked it unconfirmed. | The reply is a template; candidates are visible to the operator only (trace, approval warning). |
 | 16 | User-visible replies (`act`, `respond`) are generated with an explicit `max_tokens=ANSWER_MAX_TOKENS` (800); a reply whose stop reason is `max_tokens` is unusable — discarded before its tool calls are read, retried once, then replaced by a fixed text with the outcome from state. | Live thread `case-20261026143937-b419`: one plain-text block, `stopReason: max_tokens`, 1000 output tokens (Bedrock's implicit default): a complete answer, then run-on reasoning ("Okay, I need to figure out…"), cut mid-sentence. Not reproduced in 3 further runs (all `end_turn`, 86–152 tokens). | One extra model call when it happens; the longest normal live answer seen was about 350 tokens. |
+| 17 | Business-rule fixes from live runs: `verify` also requires the proposed `employee_id` to be an exact id returned by `get_employee` (the server files only for an exact, case-sensitive id); only unmatched lookups for names the employee actually wrote drive a fixed answer; a known flag after a request, or behind leading spaces, is a usage error; every reply prompt forbids claiming access was approved/granted/provisioned, naming internal checks or tools, and asking for internal documents; the approval prompt marks the justification as model-written. | Live: `employee_id: SAAS` was approved, then refused by the server; a lookup of "Confluence" (never asked for) replaced the reply to "what SW can I get?"; `"Mail needed" --resume <id>` became request text; replies said "access will be automatically granted", asked for an "eligibility report", named `create_access_request`, and one justification contradicted the request ("not for personal or family use" for a manager's daughter). | One more read-only lookup per distinct employee; the prompt rules are not guaranteed (§13 risk 11). |
+| 18 | A bulk access request — more than one employee (a list, a range, a team, "all employees") or software not named one by one ("all software") — gets a fixed reply from `plan`: the planner reports `bulk` in its structured output, and `may_file_request` + `bulk` ends the run with `BULK_ANSWER`, no specialists, no model text. One employee with several named systems is not bulk. | Live: "E013 … all sw" became a Salesforce proposal blocked as `not_named`; "all employees … webex" got an unverified seat claim and the backwards rule "confirm there are available seats"; "E001 to E012 … webex" exhausted the records budget and was told to "try again later". Owner chose a fixed reply over bulk filing. | Bulk detection is the model's judgement (structured output, not text matching); a missed bulk request falls back to the existing checks. |
 | 12 | Interactive mode is a flag (`-i`); no argument stays the Webex demo. Pausing an approval ends the session; a failed request returns to the prompt. | `PROMPT.md` and the validator run `python supervisor.py` as the Webex case. | — |
 
 ---
@@ -114,7 +116,7 @@ only a `Finding` reaches the supervisor.
 
 | Node | Reads | Writes | Side effects |
 |---|---|---|---|
-| `plan` | `request` | `plan`, `may_file_request` — or `error`, `answer` | ≤ 2 Bedrock calls, no tools |
+| `plan` | `request` | `plan`, `may_file_request` — or `error`, `answer` (planner failure) or `answer` (bulk, D18) | ≤ 2 Bedrock calls, no tools |
 | `worker` | `WorkerInput` | `findings: [Finding]` | Bedrock + read-only MCP calls through its own tools; never raises |
 | `act` | `request`, `findings`, `may_file_request` | `messages` (+ `answer` if no tool call) | 1 Bedrock call |
 | `verify` | last `AIMessage.tool_calls` | `checks` + `Command(goto="review")`, or `Command(goto="respond", update={"messages": NOT FILED results})` | ≤ 1 read-only `check_software_subscription` per distinct proposed software; never a write |
@@ -132,6 +134,10 @@ subscription is over its seat limit.
 calls the read-only `check_software_subscription(software)` (one call per distinct normalised
 name) and parses its rows (each MCP text block is one JSON row). The call passes only if:
 1. `employee_id` and `software` are non-empty strings;
+1a. `employee_id` is exactly (case-sensitive, untrimmed) the `employee_id` of a row returned by the
+   read-only `get_employee(employee_id)` — the server's `create_access_request` accepts only an
+   exact id, so anything else would be approved and then refused (observed live: `SAAS`). A failure
+   is recorded in `name_problems` as `no_employee`;
 2. `software` appears in the employee's request as a whole word (case-insensitive) — the model may
    substitute a system the employee never named (observed live: an "AI" request, Webex articles
    from the knowledge search, a Webex proposal). A request that only describes a tool cannot be
@@ -142,9 +148,11 @@ name) and parses its rows (each MCP text block is one JSON row). The call passes
    was proposed, that they never named it, and that they should name the software;
 3. exactly one row's `system_name` equals `software` after trimming and lower-casing — a partial
    match (`AI` → MailGuard, `Zoom` → ZoomInfo) or no row fails;
-4. that row's `over_limit` is `true` — when seats are available, no access request is needed.
+4. that row's `over_limit` is `true` — when seats are available, no access request is needed; the
+   failure is recorded in `name_problems` as `seats_available` with the system and its seat numbers.
 
-If every call passes, the matched rows are stored in `checks` and the run goes to `review`. If any
+All of a call's failures are reported together (an unknown employee and a non-exact software name
+are both stated). If every call passes, the matched rows are stored in `checks` and the run goes to `review`. If any
 call fails, **no** call is sent for approval: each gets
 `ToolMessage("NOT FILED: <reason>", status="error")` (a call that passed gets
 `NOT FILED: another proposed request in the same turn failed the pre-approval check`) and the run
@@ -158,14 +166,33 @@ A failure under point 2 is recorded in `name_problems` as `not_named`, under poi
 - *Names.* `clean_name(raw)`: newlines → spaces, markdown characters (`` ` * _ # > [ ] ( ) ~ | ``)
   removed, whitespace collapsed, clipped to 60 characters. Applied to every name a fixed text shows.
 - *Unmatched names* come from the `ExactNameLookups` marker in each worker's own tool results
-  (`Finding.unmatched`), de-duplicated case-insensitively.
-- *Trigger (i):* `act`'s usable reply proposes no write and some finding has unmatched names →
+  (`Finding.unmatched`), de-duplicated case-insensitively, and count **only if the name appears in
+  the employee's request** as a whole word — a specialist may look up a name nobody asked for
+  (observed live: "Confluence" for "what SW can I get?").
+- *Unknown employees* come the same way from the `NO EMPLOYEE FOUND` marker
+  (`Finding.unknown_employees`), under the same "written in the request" rule, and give a
+  `no_employee` fact even when nothing was proposed — observed live: "For new emploee (E099) …"
+  stopped at the records tool limit, so `verify` never ran, and the reply called E099 "eligible".
+- *Trigger (i):* `act`'s usable reply proposes no write and some finding has unmatched names or unknown employees →
   `answer` is the fixed text. *Trigger (ii):* `verify` blocked the turn and `name_problems` is
   non-empty → `respond` makes no model call and `answer` is the fixed text.
 - *Fixed text:* one fact per name, each stated once — `No system named exactly '<N>' was found.`
   for an unmatched or `no_exact` name, `The proposed system '<P>' was never named in your request.`
-  for a `not_named` proposal — then once: `Nothing was filed. Please tell us the exact name of the
-  software you need.` It never names a candidate row and never offers to file.
+  for a `not_named` proposal, `No employee with the ID '<E>' was found.` for a `no_employee` proposal —
+  and, for `seats_available`, `<System> has seats available (<a> of <l> in use), so no access request was
+  filed — one is only needed when a subscription is over its seat limit. Nothing has been assigned to
+  you yet: open an IT ticket to have a seat assigned (your manager approves it).` (grounded in the
+  dataset's license-assignment articles; observed live: the model promised "you will be provisioned") —
+  then, unless every fact is `seats_available`, once `Nothing was filed.`, then `Please tell us the employee ID.` if an employee fact is present
+  and `Please tell us the exact name of the software you need.` if a `no_exact`/`not_named` fact is present. It
+  never names a candidate row and never offers to file.
+- *Reply rules (prompts, D17).* `act` and `respond` prompts say: never claim access was approved,
+  granted, provisioned or assigned; never mention internal checks, specialists or tool names; never
+  ask the employee for internal reports or documents. `act` also files only for the employee named,
+  for their own work, with the reason they gave, never inventing a justification. `respond` gives,
+  after a rejection, only the reason the approver stated. When filing is disabled the employee is
+  told an internal check could not finish and to try again later. (A rule about quantities —
+  "x 2" — was tried and removed: live, it made the model refuse over-limit filings.)
 - *Mixed case* (a proposal passed `verify`, but a finding has unmatched names): the normal flow
   runs; after `respond`'s model reply the fixed facts for the unmatched names are appended, then
   `Please tell us the exact name of the software you need.` once. The approval prompt shows a
@@ -188,6 +215,7 @@ A failure under point 2 is recorded in `name_problems` as `not_named`, under poi
 class Plan(BaseModel):
     workers: list[Literal[*WORKER_SPECS]]   # closed set built from the spec dict
     may_file_request: bool                 # the employee lacks access to a system and wants it
+    bulk: bool = False                     # more than one employee, or software not named one by one
 ```
 
 - Call: `model.with_structured_output(Plan, include_raw=True)` — returns
@@ -197,6 +225,13 @@ class Plan(BaseModel):
   `answer` apologising that the request could not be routed, END. No workers, no tools, no write.
 - Bedrock API errors are raised before parsing, are not retried, and end the run (§11).
 - Duplicate names are removed, order kept. An empty list is valid.
+- *Bulk (D18).* `may_file_request` and `bulk` both true → `plan` returns `plan=[]`,
+  `may_file_request=False` and `answer=BULK_ANSWER`, and the run ends: no specialist, no `act`, no
+  lookups, no model text, exit 0, outcome `no access request was proposed`. `BULK_ANSWER` is
+  `Each access request covers one employee and software they name one by one. Nothing was filed.
+  Please send a separate request for each employee, naming each software you need (for example:
+  "<employee ID> needs <software>").` A bulk question with no filing (`may_file_request` false) is
+  answered normally.
 - Prompt: one line per specialist (knowledge — how-to and policy text; records — the employee's
   record and seat status; eligibility — whether they may use it and who approves), "only the
   relevant ones", an empty list allowed for trivial requests.
@@ -230,8 +265,10 @@ class Plan(BaseModel):
   employee wrote it and never substitutes a different system. Every specialist runs with the
   `ExactNameLookups` middleware: a `check_software_subscription` result with no exact-name row is
   prefixed `NO EXACT MATCH for '<name>'; these rows are substring matches only (unconfirmed
-  candidates, not '<name>'): <system names or none>.` before the specialist's model reads it. It
-  only compares names; it does not change the rows or reimplement the server.
+  candidates, not '<name>'): <system names or none>.` before the specialist's model reads it, and
+  a `get_employee` result with no rows is prefixed `NO EMPLOYEE FOUND for '<query>'.` (read into
+  `Finding.unknown_employees`). It only compares names and counts rows; it does not change the rows
+  or reimplement the server.
 - `WRITE_TOOL = "create_access_request"` is the one tool name with special meaning. The server
   marks no tool read-only (no `readOnlyHint`), so the write tool cannot be discovered — it must
   be declared client-side.
@@ -345,7 +382,8 @@ model, MCP connection or checkpoint file is touched:
 | `--resume THREAD_ID` | **resume** that thread |
 | `--status` / `--status THREAD_ID` | **status** of all threads / of one thread |
 | `--` followed by words | **one-shot** request made of the words (lets a request start with `-`) |
-| any other first argument starting with `-` | unknown option: usage, exit 2 — a mistyped flag is never sent to the model |
+| any other first argument starting with `-` (leading spaces ignored) | unknown option: usage, exit 2 — a mistyped flag is never sent to the model |
+| a request followed by a separate known flag (`"text" --resume id`) | usage, exit 2 — the flag is never folded into the request text |
 | anything else | **one-shot**: the arguments joined by spaces are the request |
 
 A known flag given with the wrong number of arguments (`--demo x`, `--resume`, `--status a b`)
@@ -357,7 +395,8 @@ argument that does not start with `-`, so it stays a request.
 `Warning: no system named exactly '<N>' exists — evidence about it is unconfirmed.` line per
 unmatched name, each specialist's evidence, the server system `verify` matched, and
 every proposed call as the tool name plus one `key: value` line per argument — exactly the
-checkpointed arguments, which the human cannot edit. `ask_human` reads one line, trimmed and
+checkpointed arguments, which the human cannot edit; `business_justification` is labelled
+`(written by the model — check it against the employee's request)`. `ask_human` reads one line, trimmed and
 lower-cased:
 - `approve`, `yes`, `y`, `ok` → `{"approved": True}`;
 - `reject`, `no`, `n` → asks for an optional reason → `{"approved": False, "reason": …}`
@@ -481,6 +520,7 @@ stopped outside an approval pause (case 4) · 130 interrupted by Ctrl-C while ru
 | Missing configuration | Exit 2 |
 | MCP unreachable, discovery failure, spec validation failure | Exit 1 |
 | Planner invalid twice | Controlled END, exit 1 |
+| Bulk filing request (D18) | `plan` ends the run with the fixed `BULK_ANSWER`, exit 0; nothing looked up or filed |
 | Bedrock error in `plan` / `act` / `respond` | Exit 1; a later `--resume` exits 3 with "no write attempted" or "write completed" (§9 case 4) |
 | Transport error in `write` | Exit 1 with the uncertain-write warning; a later `--resume` exits 3 and issues no write (§9 case 4) |
 | Any runtime error in an interactive request | Printed with its case-4 classification; the session returns to the prompt; the failed thread is never retried |
@@ -490,6 +530,9 @@ stopped outside an approval pause (case 4) · 130 interrupted by Ctrl-C while ru
 | Server files a different system than approved | Warning in the result, reply and outcome; not undone |
 | A name has no exact system (lookup marker, or `verify` name failure) | Fixed answer (§4 Answer rules); the model's text is not used |
 | A user-visible reply stops at `max_tokens` | Discarded unread, retried once, then a fixed text with the outcome |
+| Proposed employee id not found exactly | `verify`: `NOT FILED`, fixed answer asking for the employee ID; no approval prompt |
+| A specialist's employee lookup returns no one (id written in the request) | Fixed answer asking for the employee ID, even when filing was disabled; the model's text is not used |
+| Proposed software has free seats | `verify`: `NOT FILED`, fixed answer (no request needed, nothing assigned, open an IT ticket); no model text |
 
 ---
 
@@ -544,6 +587,8 @@ local `.env` that enables tracing cannot make the offline suite touch the networ
 | T28 | Pre-approval check | a request naming `AI` but a `Webex` proposal → no interrupt, no lookup, 0 writes, the result and the reply say "'Webex' was never named in your request" and ask for the exact name; `webex`/`WEBEX`/`WeBeX` in the request pass; the payload carries the original `request`, printed as `Employee's request:` at the prompt and again on `--resume`; for the probes `AI`, `ai`, `Mail`, `Zoom`, `up` a records specialist reading the lookup sees `NO EXACT MATCH for '<probe>'` with the candidates and `not '<probe>'`, and the run ends with no interrupt and no write; an exact `webex` lookup is not marked; the model proposing `MailGuard` for an `AI` request is blocked as never named; proposing `AI` literally is blocked as not an exact system name; whole-word match (`Webexpress` does not name Webex); `AI` (server would pick MailGuard), `Zoom` (ZoomInfo) and an unknown name, each named in the request → no interrupt, 0 writes, `NOT FILED` naming the reason, `respond` bound no tools, `Outcome: not filed`; exact `MailGuard` with seats available → not filed, seats reason; `webex` (case differs) → interrupt whose request shows `resolved.system_name` Webex and 42/40 seats; Webex + AI proposed together → neither reaches approval; a server that files `Cisco Webex` for an approved `Webex` → filed with `WARNING`; the lookup raising mid-run → exit 1, `--resume` exit 3 "nothing filed" |
 | T29 | Truncated replies | scripted stop reason `max_tokens`: `respond` cut off once then fine → the second reply is the answer and a retry trace line is printed; cut off twice → `Sorry — I could not produce a complete reply. Outcome: …` with the outcome from state; an `act` reply cut off twice that contains a tool call → no `verify` lookup, no interrupt, 0 writes, fixed answer; `act` and `respond` calls carry `max_tokens=800` |
 | T30 | Fixed answers for unmatched names | scripted models that try to suggest the candidate: trigger (i) for `AI`/`Mail` (MailGuard) and `Zoom` (ZoomInfo) → answer equals the fixed text, no candidate name, 0 writes; trigger (ii) `AI` proposed literally (`no_exact`) and `MailGuard` proposed for an `AI` request (`not_named`) → fixed text, no model call in `respond`; both triggers in one run → each fact once and the request for the exact name once; mixed case (Webex proposed and approved, `AI` unmatched) → model reply + appended fixed facts, approval prompt warns about `AI`; a hostile name (newline, markdown, instruction-like text) is cleaned and clipped to 60 characters |
+| T31 | Business rules from live runs | unknown employee `SAAS` → no interrupt, 0 writes, fixed answer asking for the employee ID, no `respond` model call; `" e010 "` (not exact) blocked; unknown employee + non-exact software → both facts once and both asks; a records lookup of `Confluence` for "what SW can I get?" does not replace the model's answer; `"Mail needed" --resume <id>`, `"  --resume <id> …"`, `"text" -i`, `"x" --status` → exit 2 with nothing loaded, while `-- please explain --resume` is a request; reply prompts carry the D17 rules; the approval prompt labels the model-written justification; free seats (MailGuard 70/80) → the fixed free-seats answer, no `respond` model call ; a records lookup of `E099` that returns no one, with records over its tool limit → the fixed `No employee with the ID 'E099' was found.` answer, 0 writes; lookups that find someone, or of an id the employee never wrote, leave the model's answer alone |
+| T32 | Bulk requests | the three live bulk requests ("E013 … all sw", "all employees … webex", "E001 to E012 … webex") with `bulk=True` → `BULK_ANSWER`, only the planner called, no tool call, no interrupt, outcome `no access request was proposed`; `bulk=True` with `may_file_request=False` → normal answer; `Plan.bulk` defaults to false and its description names "more than one employee" |
 | T27 | Ctrl-C and a fresh process (subprocess, real `asyncio.run`) | SIGINT raised while the approval prompt waits → `Paused`, exit 0, < 10 s; SIGINT during a model call → `Interrupted.`, exit 130, < 10 s; a process hard-killed at the approval prompt, then `--resume` in a new process approves → exactly 1 write |
 
 Live checks (server running, real Bedrock):
@@ -617,6 +662,22 @@ Open risks — reported, not assumed away:
     reaches the employee when trigger (i) or (ii) applies, and it reaches an approval prompt only in
     the mixed case, below the unmatched-name warning (§7). It can reach the employee in the mixed
     case (risk 8) and without `records` (risk 9).
+11. **Reply wording is prompt-level.** The D17 reply rules (no "approved/granted" claims, no internal
+    names, no invented justification) are instructions to the model, not guarantees; only the fixed
+    answers (D15) and the `Outcome:` line are written by code. The approver sees the original request
+    next to the model-written justification and must reject a mismatch. Live after D17: justifications
+    quoted the employee's own words, no reply named internal tools or asked for an "eligibility
+    report", but a rejected request's reply still gave its own reason ("over its seat limit") instead
+    of the approver's, and one reply claimed an unknown employee "currently has access to Jira".
+    Filing rate for an over-limit request is nondeterministic: "add WEBEX license x 2" reached the
+    gate in 5 of 7 runs with the final prompt (3 of 4 with the pre-D17 prompt).
+12. **One employee, one software, one request.** The server files one row per call; quantities
+    ("x 2") are not represented. Bulk requests get a fixed reply (D18), but only when the planner
+    flags them; one employee with several named systems is allowed and can still exceed a
+    specialist's 3-tool-call budget, which marks it `incomplete` and disables filing.
+13. **Beneficiary.** A request for someone who is not an employee (e.g. a relative) has no exact
+    `employee_id` and cannot be filed for that person; if the model files it under the requesting
+    employee's id, only the approver can catch it.
 
 ---
 

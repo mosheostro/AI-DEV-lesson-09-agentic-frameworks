@@ -172,6 +172,24 @@ class HelpTests(CliCase):
         finally:
             mock.patch.stopall()
 
+    async def test_t31_flags_hidden_in_or_after_a_request_are_usage_errors(self):
+        # Live: `"Mail needed" --resume <id>` ran as the request "Mail needed --resume <id>".
+        for p in no_runtime_resources():
+            p.start()
+        try:
+            for argv in (["Mail needed", "--resume", "case-20261026150936-e3ef"],
+                         ["  --resume case-20261026150936-e3ef MAIL needed for E001"],
+                         ["Webex please", "-i"], ["x", "--status"]):
+                code, out, _ = await run(argv, self.db, real_runtime=True)
+                self.assertEqual(code, 2, argv)
+                self.assertIn("Usage", out, argv)
+        finally:
+            mock.patch.stopall()
+        code, out, _ = await run(["--", "please explain", "--resume"], self.db,
+                                 model=make_model(workers=[], may_file=False))
+        self.assertEqual(code, 0, out)                          # after `--` everything is the request
+        self.assertIn("You: please explain --resume", out)
+
     async def test_t23_double_dash_passes_a_request_starting_with_dash(self):
         code, out, _ = await run(["--", "-x", "policy?"], self.db, model=make_model(workers=["knowledge"], may_file=False))
         self.assertEqual(code, 0, out)

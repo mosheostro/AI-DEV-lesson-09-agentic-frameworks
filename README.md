@@ -29,11 +29,11 @@ plan ──► worker × k (parallel) ──► act ──► verify ──► r
 
 | Step | What it does |
 |---|---|
-| **plan** | The model picks the specialists this request needs (`knowledge`, `records`, `eligibility`, or none) as structured output from a closed set; invalid output is retried once, then the run ends with a fixed error. |
+| **plan** | The model picks the specialists this request needs (`knowledge`, `records`, `eligibility`, or none) as structured output from a closed set; invalid output is retried once, then the run ends with a fixed error. A bulk access request (more than one employee, or "all software") ends here with a fixed reply. |
 | **worker** | Each chosen specialist is its own agent with 2–3 **read-only** MCP tools, at most 3 tool calls and a step limit; they run in one parallel superstep and their findings merge through a reducer. A failed or incomplete specialist disables the write path. |
 | **act** | The only step that can propose `create_access_request`, and only when the planner judged a filing relevant and every finding is complete. |
-| **verify** | Deterministic, read-only checks before anyone is asked: the software must be named in the employee's request, must match exactly one subscription by exact name (the server itself matches names by substring), and must be over its seat limit. Otherwise nothing is filed and the employee gets a fixed reply asking for the exact software name. |
-| **review** | `interrupt()` shows the approver the original request, the evidence, the resolved system and its seats, and the exact proposed arguments. Only an explicit approval proceeds; anything else is a rejection. |
+| **verify** | Deterministic, read-only checks before anyone is asked: the employee ID must exist exactly as the server will file it; the software must be named in the employee's request, must match exactly one subscription by exact name (the server itself matches names by substring), and must be over its seat limit. Otherwise nothing is filed and the employee gets a fixed reply: it asks for the employee ID or the exact software name, or — when seats are free — says no request is needed and to open an IT ticket. An employee ID that a specialist's lookup did not find gets the same fixed reply even when nothing was proposed. |
+| **review** | `interrupt()` shows the approver the original request, the evidence, the resolved system and its seats, and the exact proposed arguments; the business justification is marked as written by the model, to check against the request. Only an explicit approval proceeds; anything else is a rejection. |
 | **write** | Sends the checkpointed arguments unchanged — the model never regenerates them — at most once per employee + software within a run; a server result naming a different system is flagged. |
 | **respond** | Writes the final reply with no tools bound. User-visible replies are capped at `ANSWER_MAX_TOKENS` (800); a reply cut off at that limit is discarded, retried once, then replaced by a fixed text. |
 
@@ -145,12 +145,12 @@ From the repository root, with the dependencies installed:
 python -m unittest discover -s tests -v
 ```
 
-The suite (83 tests, standard-library `unittest`) is fully **offline**: a scripted chat model and
+The suite (96 tests, standard-library `unittest`) is fully **offline**: a scripted chat model and
 fake MCP tools stand in for Bedrock and the server, persistence tests use temporary SQLite files,
 and no `.env`, credentials or network access are needed. It covers planning, parallel fan-out,
-specialist limits, the pre-approval check, approval and rejection input, duplicate writes,
-truncated replies, the CLI modes, Ctrl-C handling, pause/resume across processes, and
-uncertain-write recovery.
+specialist limits, the pre-approval check (employee ID, software name, seat limit), approval and
+rejection input, duplicate writes, truncated replies, the CLI modes, Ctrl-C handling,
+pause/resume across processes, and uncertain-write recovery.
 
 There are no automated live tests. End-to-end checks against a running server and real Bedrock
 are described in `SPEC.md` §12 ("Live checks"); they need the setup above, and an approved request
@@ -171,6 +171,15 @@ These are documented in `SPEC.md` (§8 and §13); the main ones:
 - **Model behaviour is not deterministic.** The planner may choose a different team, a specialist
   may run out of its tool budget (which disables filing), and the model's own wording can still
   mention a substring candidate when one request mixes a valid and an unmatched name.
+- **Reply wording is guided by the prompt, not guaranteed.** The model is told never to claim that
+  access was granted, never to name internal tools, and never to invent a justification or a
+  rejection reason; only the fixed replies and the `Outcome:` line are written by code. The
+  approver must check the model-written justification against the request.
+- **One employee per request.** A bulk request — several employees ("all employees", "E001 to
+  E012") or software not named one by one ("all software") — gets a fixed reply asking for one
+  request per employee; the planner model decides what is bulk. Quantities ("x 2") are not
+  represented, and one employee with several named systems can still exhaust a specialist's
+  3-call budget, which disables filing.
 - **Durability lives in the CLI.** `build_graph(tools)` on its own pauses in memory; the CLI adds
   the SQLite checkpointer.
 - **The approval decision is not recorded on the server,** and the server's data is in memory.

@@ -147,6 +147,9 @@ def make_model(workers=("records", "eligibility"), may_file=True, plans=None, **
     return ScriptedModel(replies={**DEFAULT_REPLIES, **replies}, plans=list(plans))
 
 
+# Employees the fake server knows: id -> (full name, role). Filing needs an exact id.
+EMPLOYEES = {"E001": ("Maya Cohen", "Customer Success Manager"), "E010": ("Rachel Stein", "CS Specialist"),
+             "E013": ("Emma Wilson", "COO")}
 # Subscriptions the fake server knows: name -> (seat_limit, active_seats).
 SUBSCRIPTIONS = {"MailGuard": (80, 70), "Miro": (25, 30), "Webex": (40, 42), "ZoomInfo": (15, 12)}
 
@@ -183,9 +186,12 @@ class FakeServer:
             log.append(("search_knowledge_base", {"query": query}))
             return "KB: restart the client after a licence change."
 
-        async def get_employee(query: str) -> str:
+        async def get_employee(query: str) -> list:
             log.append(("get_employee", {"query": query}))
-            return json.dumps({"employee_id": "E010", "name": "Rachel Stein", "role": "CS Specialist"})
+            rows = [{"employee_id": eid, "full_name": name, "role": role}
+                    for eid, (name, role) in EMPLOYEES.items()
+                    if eid == query or query.lower() in name.lower()]   # like the server: exact id or name substring
+            return [{"type": "text", "text": json.dumps(row)} for row in rows]
 
         async def check_software_subscription(software: str) -> list:
             log.append(("check_software_subscription", {"software": software}))

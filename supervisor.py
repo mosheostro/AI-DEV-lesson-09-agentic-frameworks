@@ -59,10 +59,16 @@ CHECKPOINT_DB = Path(__file__).resolve().parent / "checkpoints.sqlite"
 WRITE_TOOL = "create_access_request"
 # Read-only lookup `verify` uses to prove a proposed software name is exact and over its seat limit.
 SUBSCRIPTION_TOOL = "check_software_subscription"
+# Read-only lookup `verify` uses to prove the employee exists; filing needs the exact id.
+EMPLOYEE_TOOL = "get_employee"
 NOT_NAMED = "was never named in your request"
 # Output cap for the replies the employee reads (act, respond); longest normal live answer ~350 tokens.
 ANSWER_MAX_TOKENS = 800
 ASK_NAME = "Please tell us the exact name of the software you need."
+ASK_EMPLOYEE = "Please tell us the employee ID."
+BULK_ANSWER = ("Each access request covers one employee and software they name one by one. Nothing was "
+               "filed. Please send a separate request for each employee, naming each software you need "
+               "(for example: \"<employee ID> needs <software>\").")
 
 # The bound is what keeps a sub-agent from wandering; ToolCallLimitMiddleware enforces it.
 _BOUND = " At most 3 tool calls. Facts only, 2–3 sentences. Do not decide or file anything."
@@ -103,21 +109,32 @@ PLANNER_PROMPT = (
     "Return an empty list if the request needs no lookups (e.g. a greeting). Set "
     "may_file_request to true only if the employee lacks access to a system and wants it."
 )
+# Live replies claimed "access will be automatically granted", asked employees for an
+# "eligibility report" and named internal tools; these rules apply to every reply.
+_REPLY_RULES = (
+    " Never say that access is approved, granted, provisioned or assigned — you can only file a "
+    "request that a human must approve. Never mention internal checks, specialists or tool names, "
+    "and never ask the employee for internal reports or documents."
+)
 ACT_PROMPT = (
     "You are the NovaOps supervisor. Your team gathered the evidence below. If the employee is "
     "eligible and the subscription is over its seat limit, file an access request with "
     "create_access_request (a human approves it before it is sent). Otherwise answer the "
-    "employee clearly from the evidence."
+    "employee clearly from the evidence." + _REPLY_RULES +
+    " File only for the employee named in the request, for their own work, with the reason they "
+    "gave — never invent a justification."
 )
 _ACT_NO_FILING = (
-    "\n\nFiling is disabled for this request: the evidence is incomplete or a specialist failed. "
-    "Tell the employee which evidence is missing and that no access request was filed."
+    "\n\nFiling is disabled for this request because an internal check could not finish. Answer "
+    "what you can from the evidence, say plainly that no access request was filed, and suggest "
+    "that they try again later."
 )
 _ACT_READ_ONLY = "\n\nNo access request is needed for this request; just answer it."
 RESPOND_PROMPT = (
     "You are the NovaOps supervisor writing the final reply to the employee. Use the evidence "
     "and the outcome of the proposed access request. Say plainly whether a request was filed "
-    "(and its id and status) or that it was not filed and why. Be brief and grounded."
+    "(and its id and status) or that it was not filed and why. If the approver rejected it, say so "
+    "and give only the reason the approver stated. Be brief and grounded." + _REPLY_RULES
 )
 
 
@@ -126,6 +143,9 @@ class Plan(BaseModel):
         description="The specialists to consult for this request; may be empty.")
     may_file_request: bool = Field(
         description="True only if the employee lacks access to a system and wants it.")
+    bulk: bool = Field(default=False, description=(
+        "True if the request is for more than one employee (a list, a range, a team, 'all employees') "
+        "or for software not named one by one ('all software', 'everything')."))
 
 
 class Finding(TypedDict):
@@ -135,6 +155,7 @@ class Finding(TypedDict):
     seconds: float
     tool_calls: int
     unmatched: list[str]
+    unknown_employees: list[str]
 
 
 class WorkerInput(TypedDict):
@@ -225,58 +246,110 @@ def mark_substring_rows(message: ToolMessage, software: str) -> ToolMessage:
     if message.status == "error" or any(str(r.get("system_name", "")).strip().lower() == wanted.lower() for r in rows):
         return message
     names = ", ".join(str(r.get("system_name")) for r in rows) or "none"
-    note = (f"NO EXACT MATCH for '{wanted}'; these rows are substring matches only "
-            f"(unconfirmed candidates, not '{wanted}'): {names}.")
+    return prefixed(message, f"NO EXACT MATCH for '{wanted}'; these rows are substring matches only "
+                             f"(unconfirmed candidates, not '{wanted}'): {names}.")
+
+
+def mark_missing_employee(message: ToolMessage, query: str) -> ToolMessage:
+    """Prefixes an employee lookup that returned no one with NO EMPLOYEE FOUND."""
+    if message.status == "error" or json_rows(message):
+        return message
+    return prefixed(message, f"NO EMPLOYEE FOUND for '{query.strip()}'.")
+
+
+def prefixed(message: ToolMessage, note: str) -> ToolMessage:
     content = message.content
     content = [{"type": "text", "text": note}, *content] if isinstance(content, list) else f"{note}\n{content}"
     return message.model_copy(update={"content": content})
 
 
 _MARKER = re.compile(r"NO EXACT MATCH for '(.*)'; these rows are substring matches only", re.DOTALL)
+_NO_EMPLOYEE = re.compile(r"NO EMPLOYEE FOUND for '(.*)'\.$", re.DOTALL)
 _MARKDOWN = re.compile(r"[`*_#>\[\]()~|]")
+
+
+def plain(raw) -> str:
+    """Newlines and markdown removed, whitespace collapsed — not clipped."""
+    name = _MARKDOWN.sub("", str(raw).replace("\r", " ").replace("\n", " "))
+    return " ".join(name.split())
 
 
 def clean_name(raw) -> str:
     """A model-supplied name made safe to quote in a fixed answer."""
-    name = _MARKDOWN.sub("", str(raw).replace("\r", " ").replace("\n", " "))
-    return " ".join(name.split())[:60].strip()
+    return plain(raw)[:60].strip()
 
 
-def unmatched_in(messages) -> list[str]:
-    """Names whose subscription lookup ExactNameLookups marked, read from tool results only."""
+def named_in(name, request) -> bool:
+    """`name` appears in the employee's request as a whole word (case-insensitive)."""
+    wanted = plain(name).lower()
+    return bool(wanted) and re.search(rf"(?<!\w){re.escape(wanted)}(?!\w)", plain(request).lower()) is not None
+
+
+def unmatched_in(messages, marker=_MARKER) -> list[str]:
+    """Names whose lookup ExactNameLookups marked, read from tool results only."""
     names = []
     for m in messages:
         if isinstance(m, ToolMessage):
             first = m.content[0] if isinstance(m.content, list) and m.content else m.content
-            match = _MARKER.match(first.get("text", "") if isinstance(first, dict) else str(first))
+            match = marker.match(first.get("text", "") if isinstance(first, dict) else str(first))
             if match:
-                names.append(clean_name(match.group(1)))
+                names.append(plain(match.group(1)))
     return names
 
 
-def name_facts(state: dict) -> list[str]:
-    """One fixed sentence per unmatched or blocked name, each fact once (SPEC §4 Answer rules)."""
+def unmatched_names(state: dict, key: str = "unmatched") -> list[str]:
+    """Unmatched lookups for names the employee actually wrote. A specialist may look up a name
+    nobody asked for (live: "Confluence" for "what SW can I get?"); that must not drive the answer."""
+    names = []
+    for finding in state.get("findings", []):
+        for name in finding.get(key, []):
+            shown = clean_name(name)
+            if named_in(name, state.get("request", "")) and shown.lower() not in (n.lower() for n in names):
+                names.append(shown)
+    return names
+
+
+def name_facts(state: dict) -> list[tuple[str, str]]:
+    """(kind, sentence) per unmatched or blocked name, each fact once (SPEC §4 Answer rules)."""
     facts, seen = [], set()
 
     def add(kind, name, sentence):
         if (kind, name.lower()) not in seen:
             seen.add((kind, name.lower()))
-            facts.append(sentence)
+            facts.append((kind, sentence))
 
-    for finding in state.get("findings", []):
-        for name in finding.get("unmatched", []):
-            add("no_exact", name, f"No system named exactly '{name}' was found.")
+    for name in unmatched_names(state):
+        add("no_exact", name, f"No system named exactly '{name}' was found.")
+    # Live: E099 was found by no lookup, nothing was proposed, and the reply called E099 "eligible".
+    for name in unmatched_names(state, "unknown_employees"):
+        add("no_employee", name, f"No employee with the ID '{name}' was found.")
     for problem in state.get("name_problems", []):
         name = clean_name(problem["name"])
         if problem["kind"] == "no_exact":
             add("no_exact", name, f"No system named exactly '{name}' was found.")
+        elif problem["kind"] == "no_employee":
+            add("no_employee", name, f"No employee with the ID '{name}' was found.")
+        elif problem["kind"] == "seats_available":
+            # Live: the model promised "you will be provisioned"; nothing is assigned by this assistant.
+            add("seats_available", name,
+                f"{name} has seats available ({problem.get('active')} of {problem.get('limit')} in use), so no "
+                "access request was filed — one is only needed when a subscription is over its seat limit. "
+                "Nothing has been assigned to you yet: open an IT ticket to have a seat assigned (your manager "
+                "approves it).")
         else:
             add("not_named", name, f"The proposed system '{name}' {NOT_NAMED}.")
     return facts
 
 
-def fixed_answer(facts: list[str]) -> str:
-    return " ".join(facts) + " Nothing was filed. " + ASK_NAME
+def asks_for(facts: list[tuple[str, str]]) -> list[str]:
+    asks = [ASK_EMPLOYEE] if any(kind == "no_employee" for kind, _ in facts) else []
+    return asks + ([ASK_NAME] if any(kind in ("no_exact", "not_named") for kind, _ in facts) else [])
+
+
+def fixed_answer(facts: list[tuple[str, str]]) -> str:
+    # The free-seats sentence already says nothing was filed and what to do instead.
+    closing = ["Nothing was filed."] + asks_for(facts) if any(k != "seats_available" for k, _ in facts) else []
+    return " ".join([sentence for _, sentence in facts] + closing)
 
 
 def truncated(reply) -> bool:
@@ -304,12 +377,14 @@ class ExactNameLookups(AgentMiddleware):
         result = await handler(request)
         if request.tool_call["name"] == SUBSCRIPTION_TOOL and isinstance(result, ToolMessage):
             return mark_substring_rows(result, str(request.tool_call["args"].get("software", "")))
+        if request.tool_call["name"] == EMPLOYEE_TOOL and isinstance(result, ToolMessage):
+            return mark_missing_employee(result, str(request.tool_call["args"].get("query", "")))
         return result
 
 
 def build_graph(tools: list, model=None, checkpointer=None):
     by_name = {t.name: t for t in tools}
-    for required in (WRITE_TOOL, SUBSCRIPTION_TOOL):
+    for required in (WRITE_TOOL, SUBSCRIPTION_TOOL, EMPLOYEE_TOOL):
         if required not in by_name:
             raise ValueError(f"the MCP server did not offer {required}")
     for name, spec in WORKER_SPECS.items():
@@ -321,6 +396,7 @@ def build_graph(tools: list, model=None, checkpointer=None):
     if model is None:
         model = get_model()
     write_tool, subscription_tool = by_name[WRITE_TOOL], by_name[SUBSCRIPTION_TOOL]
+    employee_tool = by_name[EMPLOYEE_TOOL]
 
     workers = {
         name: create_agent(
@@ -344,11 +420,16 @@ def build_graph(tools: list, model=None, checkpointer=None):
                     "answer": "Sorry — I could not work out how to route your request, so nothing "
                               "was looked up or filed. Please rephrase it or contact IT directly."}
         chosen = list(dict.fromkeys(picked.workers))
+        if picked.may_file_request and picked.bulk:
+            # Live: bulk requests exhausted the specialists' tool budget or became a request for a
+            # system nobody named; one request covers one employee, so nothing is looked up.
+            trace("plan", "bulk access request — fixed answer, no lookups")
+            return {"plan": [], "may_file_request": False, "answer": BULK_ANSWER}
         trace("plan", f"team: {', '.join(chosen) or '(none)'}   may_file_request={picked.may_file_request}")
         return {"plan": chosen, "may_file_request": picked.may_file_request}
 
     def route_after_plan(state: SupervisorState):
-        if state.get("error"):
+        if state.get("error") or state.get("answer"):
             return END
         sends = [Send("worker", WorkerInput(name=n, request=state["request"])) for n in state.get("plan", [])]
         return sends or "act"
@@ -356,12 +437,13 @@ def build_graph(tools: list, model=None, checkpointer=None):
     async def worker(payload: WorkerInput) -> dict:
         name, started = payload["name"], time.perf_counter()
         trace(name, f"working ... (tools: {', '.join(WORKER_SPECS[name]['tools'])})")
-        status, summary, used, unmatched = "ok", "", 0, []
+        status, summary, used, unmatched, unknown = "ok", "", 0, [], []
         try:
             result = await workers[name].ainvoke(
                 {"messages": [HumanMessage(payload["request"])]}, config={"recursion_limit": 12})
             messages = result["messages"]
             unmatched = unmatched_in(messages)
+            unknown = unmatched_in(messages, _NO_EMPLOYEE)
             results = [m for m in messages if isinstance(m, ToolMessage)]
             blocked = [m for m in results if str(m.content).startswith("Tool call limit exceeded")]
             used = len(results) - len(blocked)
@@ -378,7 +460,8 @@ def build_graph(tools: list, model=None, checkpointer=None):
         trace(name, f"{status} in {seconds:.1f}s ({used} tool calls)")
         return {"findings": [Finding(agent=name, status=status, summary=summary or "No report produced.",
                                      seconds=round(seconds, 2), tool_calls=used,
-                                     unmatched=list(dict.fromkeys(unmatched)))]}
+                                     unmatched=list(dict.fromkeys(unmatched)),
+                                     unknown_employees=list(dict.fromkeys(unknown)))]}
 
     async def act(state: SupervisorState) -> dict:
         findings = state.get("findings", [])
@@ -401,7 +484,7 @@ def build_graph(tools: list, model=None, checkpointer=None):
             # text is not used, so it can never point the employee at a substring match.
             update["answer"] = fixed_answer(facts) if facts else text_of(reply)
             if facts:
-                trace("act", "fixed answer (model text not used): " + " ".join(facts))
+                trace("act", "fixed answer (model text not used): " + " ".join(s for _, s in facts))
         return update
 
     def route_after_act(state: SupervisorState):
@@ -412,42 +495,54 @@ def build_graph(tools: list, model=None, checkpointer=None):
         # The server resolves names by substring ("AI" -> MailGuard), so a proposal reaches the
         # approver only if its name is an exact subscription name that is over its seat limit.
         pending = state["messages"][-1].tool_calls
-        lookups, checks, failures, problems = {}, {}, {}, []
+        lookups, people, checks, failures, problems = {}, {}, {}, {}, []
         for call in pending:
             if call["name"] != WRITE_TOOL:
                 continue
             if duplicate_key(call["args"]) is None:
                 failures[call["id"]] = "employee_id and software are required"
                 continue
-            software = call["args"]["software"].strip()
-            wanted = software.lower()
+            software, employee = call["args"]["software"].strip(), call["args"]["employee_id"]
+            wanted, reasons, row = software.lower(), [], None
+            # Filing accepts only an exact, case-sensitive employee id (live: "SAAS" was approved,
+            # then refused by the server), so the employee must be found exactly as proposed.
+            if employee not in people:
+                people[employee] = await employee_tool.ainvoke(
+                    {"type": "tool_call", "id": f"verify-employee-{call['id']}", "name": EMPLOYEE_TOOL,
+                     "args": {"query": employee}})
+            if not any(str(r.get("employee_id")) == employee for r in json_rows(people[employee])):
+                reasons.append(f"no employee with the ID '{employee}' was found")
+                problems.append({"kind": "no_employee", "name": employee})
             # The model may substitute a system the employee never named (live: an "AI" request
             # became a Webex proposal), so the name must appear in the request as a whole word.
-            if not re.search(rf"(?<!\w){re.escape(wanted)}(?!\w)", state["request"].lower()):
-                failures[call["id"]] = (f"the proposed system '{software}' {NOT_NAMED}. "
-                                        "Please tell us the exact name of the software you need")
+            if not named_in(software, state["request"]):
+                reasons.append(f"the proposed system '{software}' {NOT_NAMED}. "
+                               "Please tell us the exact name of the software you need")
                 problems.append({"kind": "not_named", "name": software})
-                continue
-            if wanted not in lookups:
-                lookups[wanted] = await subscription_tool.ainvoke(
-                    {"type": "tool_call", "id": f"verify-{call['id']}", "name": SUBSCRIPTION_TOOL,
-                     "args": {"software": software}})
-            result = lookups[wanted]
-            if result.status == "error":
-                failures[call["id"]] = f"the subscription lookup failed: {text_of(result)[:200]}"
-                continue
-            rows = json_rows(result)
-            exact = [r for r in rows if str(r.get("system_name", "")).strip().lower() == wanted]
-            if len(exact) != 1:
-                names = ", ".join(str(r.get("system_name")) for r in rows)
-                failures[call["id"]] = (f"'{software}' is not an exact system name — "
-                                        + (f"the server would match: {names}" if names else "no subscription has that name"))
-                problems.append({"kind": "no_exact", "name": software})
-                continue
-            row = exact[0]
-            if row.get("over_limit") is not True:
-                failures[call["id"]] = (f"{row['system_name']} has seats available ({row.get('active_seats')} of "
-                                        f"{row.get('seat_limit')} in use), so no access request is needed")
+            else:
+                if wanted not in lookups:
+                    lookups[wanted] = await subscription_tool.ainvoke(
+                        {"type": "tool_call", "id": f"verify-{call['id']}", "name": SUBSCRIPTION_TOOL,
+                         "args": {"software": software}})
+                result = lookups[wanted]
+                rows = json_rows(result)
+                exact = [r for r in rows if str(r.get("system_name", "")).strip().lower() == wanted]
+                if result.status == "error":
+                    reasons.append(f"the subscription lookup failed: {text_of(result)[:200]}")
+                elif len(exact) != 1:
+                    names = ", ".join(str(r.get("system_name")) for r in rows)
+                    reasons.append(f"'{software}' is not an exact system name — "
+                                   + (f"the server would match: {names}" if names else "no subscription has that name"))
+                    problems.append({"kind": "no_exact", "name": software})
+                elif exact[0].get("over_limit") is not True:
+                    reasons.append(f"{exact[0]['system_name']} has seats available ({exact[0].get('active_seats')} of "
+                                   f"{exact[0].get('seat_limit')} in use), so no access request is needed")
+                    problems.append({"kind": "seats_available", "name": exact[0]["system_name"],
+                                     "active": exact[0].get("active_seats"), "limit": exact[0].get("seat_limit")})
+                else:
+                    row = exact[0]
+            if reasons:
+                failures[call["id"]] = "; ".join(reasons)
                 continue
             checks[call["id"]] = {k: row.get(k) for k in ("system_name", "seat_limit", "active_seats", "over_limit")}
         if not failures:
@@ -470,7 +565,7 @@ def build_graph(tools: list, model=None, checkpointer=None):
             "evidence": [{"agent": f["agent"], "status": f["status"], "summary": f["summary"]}
                          for f in state.get("findings", [])],
             "request": state.get("request", ""),
-            "unmatched": list(dict.fromkeys(n for f in state.get("findings", []) for n in f.get("unmatched", []))),
+            "unmatched": unmatched_names(state),
         })
         if isinstance(decision, dict) and decision.get("approved") is True:
             trace("review", "approved")
@@ -524,14 +619,14 @@ def build_graph(tools: list, model=None, checkpointer=None):
         if state.get("name_problems"):
             # Trigger (ii): verify blocked a name — a fixed answer; the model is not asked.
             answer = fixed_answer(facts)
-            trace("respond", "fixed answer: " + "; ".join(facts))
+            trace("respond", "fixed answer: " + " ".join(s for _, s in facts))
             return {"answer": answer, "messages": [AIMessage(answer)]}
         reply = await answer_call(model.bind(max_tokens=ANSWER_MAX_TOKENS),
                                   [SystemMessage(RESPOND_PROMPT), HumanMessage(prompt)], "respond")
         answer = (text_of(reply) if reply is not None else
                   f"Sorry — I could not produce a complete reply. Outcome: {outcome_of(state)}.")
         if facts:   # mixed case: the filed request stays; each unmatched name is still stated
-            answer = "\n\n".join([answer, " ".join(facts) + " " + ASK_NAME])
+            answer = "\n\n".join([answer, " ".join([s for _, s in facts] + asks_for(facts))])
         return {"answer": answer, "messages": [reply if reply is not None else AIMessage(answer)]}
 
     graph = StateGraph(SupervisorState)
@@ -574,6 +669,9 @@ REJECT_ANSWERS = ("reject", "no", "n")
 REQUEST_PROMPT = "\nRequest (exit/quit to leave): "
 
 
+_FLAGS = ("-h", "--help", "--demo", "-i", "--interactive", "--resume", "--status", "--")
+
+
 def parse_args(argv: list[str]) -> tuple[str, str | None] | None:
     """(mode, value) for SPEC.md §9's argument table, or None for a usage error."""
     first, rest = (argv[0], argv[1:]) if argv else ("", [])
@@ -589,7 +687,9 @@ def parse_args(argv: list[str]) -> tuple[str, str | None] | None:
         return "status", rest[0] if rest else None
     if first == "--" and " ".join(rest).strip():
         return "request", " ".join(rest).strip()
-    if first.startswith("-"):
+    # A flag hidden behind spaces ("  --resume …") or placed after the request ("text" --resume id)
+    # is a mistake, never request text; `--` is the one way to send a request that looks like one.
+    if first.lstrip().startswith("-") or any(arg.strip() in _FLAGS for arg in rest):
         return None
     return "request", " ".join(argv).strip() or DEFAULT_REQUEST
 
@@ -647,6 +747,8 @@ def show_approval(payload: dict, thread: str) -> None:
     for item in payload["requests"]:
         print(f"  proposed write: {item['tool']}")
         for key, value in item["args"].items():
+            if key == "business_justification":   # the model wrote it; the employee may have said otherwise
+                key += " (written by the model — check it against the employee's request)"
             print(f"      {key}: {value}")
         resolved = item.get("resolved")
         if resolved:
