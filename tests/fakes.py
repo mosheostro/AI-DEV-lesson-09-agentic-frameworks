@@ -148,10 +148,16 @@ def make_model(workers=("records", "eligibility"), may_file=True, plans=None, **
 
 
 # Employees the fake server knows: id -> (full name, role). Filing needs an exact id.
+# Two Mayas, like the real seed data (duplicate first names on purpose).
 EMPLOYEES = {"E001": ("Maya Cohen", "Customer Success Manager"), "E010": ("Rachel Stein", "CS Specialist"),
-             "E013": ("Emma Wilson", "COO")}
+             "E013": ("Emma Wilson", "COO"), "E017": ("Daniel Cohen", "Sales Operations Specialist"),
+             "E020": ("Maya Rosen", "HR Coordinator")}
 # Subscriptions the fake server knows: name -> (seat_limit, active_seats).
 SUBSCRIPTIONS = {"MailGuard": (80, 70), "Miro": (25, 30), "Webex": (40, 42), "ZoomInfo": (15, 12)}
+
+
+def email(full_name: str) -> str:
+    return full_name.lower().replace(" ", ".") + "@novaops.example"
 
 
 class FakeServer:
@@ -160,10 +166,12 @@ class FakeServer:
     write_mode: "ok" | "server_error" (MCP isError result) | "transport" (connection drops
     after the server received the call — the outcome is unknown to the client).
     lookup_mode: "ok" | "transport" (check_software_subscription raises).
-    extra_systems: systems without a subscription that filing can still match."""
+    extra_systems: systems without a subscription that filing can still match.
+    extra_employees: id -> (full name, role), added to EMPLOYEES."""
 
-    def __init__(self, write_mode: str = "ok", lookup_mode: str = "ok", extra_systems=()):
+    def __init__(self, write_mode: str = "ok", lookup_mode: str = "ok", extra_systems=(), extra_employees=None):
         self.write_mode, self.lookup_mode = write_mode, lookup_mode
+        self.employees = {**EMPLOYEES, **(extra_employees or {})}
         self.systems = sorted([*SUBSCRIPTIONS, *extra_systems])
         self.log: list[tuple[str, dict]] = []
 
@@ -188,9 +196,10 @@ class FakeServer:
 
         async def get_employee(query: str) -> list:
             log.append(("get_employee", {"query": query}))
-            rows = [{"employee_id": eid, "full_name": name, "role": role}
-                    for eid, (name, role) in EMPLOYEES.items()
-                    if eid == query or query.lower() in name.lower()]   # like the server: exact id or name substring
+            rows = [{"employee_id": eid, "full_name": name, "email": email(name), "role": role}
+                    for eid, (name, role) in sorted(self.employees.items(), key=lambda e: e[1][0])
+                    # like the server: exact id, exact email (any case), or name substring
+                    if eid == query or query.lower() == email(name) or query.lower() in name.lower()]
             return [{"type": "text", "text": json.dumps(row)} for row in rows]
 
         async def check_software_subscription(software: str) -> list:

@@ -145,7 +145,7 @@ From the repository root, with the dependencies installed:
 python -m unittest discover -s tests -v
 ```
 
-The suite (96 tests, standard-library `unittest`) is fully **offline**: a scripted chat model and
+The suite (107 tests, standard-library `unittest`) is fully **offline**: a scripted chat model and
 fake MCP tools stand in for Bedrock and the server, persistence tests use temporary SQLite files,
 and no `.env`, credentials or network access are needed. It covers planning, parallel fan-out,
 specialist limits, the pre-approval check (employee ID, software name, seat limit), approval and

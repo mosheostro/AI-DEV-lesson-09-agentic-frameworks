@@ -66,6 +66,7 @@ NOT_NAMED = "was never named in your request"
 ANSWER_MAX_TOKENS = 800
 ASK_NAME = "Please tell us the exact name of the software you need."
 ASK_EMPLOYEE = "Please tell us the employee ID."
+UNIDENTIFIED = "Your request does not identify the employee exactly."
 BULK_ANSWER = ("Each access request covers one employee and software they name one by one. Nothing was "
                "filed. Please send a separate request for each employee, naming each software you need "
                "(for example: \"<employee ID> needs <software>\").")
@@ -115,6 +116,9 @@ _REPLY_RULES = (
     " Never say that access is approved, granted, provisioned or assigned — you can only file a "
     "request that a human must approve. Never mention internal checks, specialists or tool names, "
     "and never ask the employee for internal reports or documents."
+    # Live: "Webex is at its seat limit, so I cannot file a request for you".
+    " A subscription being over its seat limit is the reason a request is filed, never a reason "
+    "it cannot be."
 )
 ACT_PROMPT = (
     "You are the NovaOps supervisor. Your team gathered the evidence below. If the employee is "
@@ -156,6 +160,7 @@ class Finding(TypedDict):
     tool_calls: int
     unmatched: list[str]
     unknown_employees: list[str]
+    ambiguous_employees: list[str]
 
 
 class WorkerInput(TypedDict):
@@ -309,12 +314,51 @@ def unmatched_names(state: dict, key: str = "unmatched") -> list[str]:
     return names
 
 
+def reversed_name(name: str) -> str:
+    """The words of a multi-word name in reverse order ("cohen daniel" -> "daniel cohen"), else ""."""
+    words = str(name).split()
+    return " ".join(reversed(words)) if len(words) > 1 else ""
+
+
+def full_name_in(full: str, request: str) -> bool:
+    return named_in(full, request) or bool(reversed_name(full)) and named_in(reversed_name(full), request)
+
+
+def named_by(person: dict, rows: list[dict], request: str) -> bool:
+    """The request names this employee by id, email, or a full name no other row in `rows` has.
+    The server matches names by substring and the seed data repeats first names on purpose."""
+    if named_in(person.get("employee_id", ""), request) or named_in(person.get("email") or "", request):
+        return True
+    full = str(person.get("full_name") or "")
+    return full_name_in(full, request) and len(
+        [r for r in rows if str(r.get("full_name", "")).lower() == full.lower()]) == 1
+
+
+async def identified(person: dict, request: str, find) -> bool:
+    full = str(person.get("full_name") or "")
+    return named_by(person, await find(full) if full_name_in(full, request) else [], request)
+
+
+def ambiguous_in(messages, request: str) -> list[str]:
+    """Employee lookups for a name the employee wrote that matched several people, none of whom
+    the request identifies (live: "maya" — the reply then listed both Mayas)."""
+    queries = {c["id"]: str(c["args"].get("query", ""))
+               for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
+    names = []
+    for m in messages:
+        if isinstance(m, ToolMessage) and m.name == EMPLOYEE_TOOL and m.status != "error":
+            rows, query = json_rows(m), queries.get(m.tool_call_id, "")
+            if len(rows) > 1 and named_in(query, request) and not any(named_by(r, rows, request) for r in rows):
+                names.append(plain(query))
+    return names
+
+
 def name_facts(state: dict) -> list[tuple[str, str]]:
     """(kind, sentence) per unmatched or blocked name, each fact once (SPEC §4 Answer rules)."""
     facts, seen = [], set()
 
     def add(kind, name, sentence):
-        if (kind, name.lower()) not in seen:
+        if (kind, name.lower()) not in seen and (kind, sentence) not in facts:
             seen.add((kind, name.lower()))
             facts.append((kind, sentence))
 
@@ -322,13 +366,18 @@ def name_facts(state: dict) -> list[tuple[str, str]]:
         add("no_exact", name, f"No system named exactly '{name}' was found.")
     # Live: E099 was found by no lookup, nothing was proposed, and the reply called E099 "eligible".
     for name in unmatched_names(state, "unknown_employees"):
-        add("no_employee", name, f"No employee with the ID '{name}' was found.")
+        add("no_employee", name, f"No employee matching '{name}' was found.")
+    for name in unmatched_names(state, "ambiguous_employees"):
+        add("no_employee", name, UNIDENTIFIED)
     for problem in state.get("name_problems", []):
         name = clean_name(problem["name"])
         if problem["kind"] == "no_exact":
             add("no_exact", name, f"No system named exactly '{name}' was found.")
-        elif problem["kind"] == "no_employee":
+        elif problem["kind"] == "no_employee" and named_in(problem["name"], state.get("request", "")):
             add("no_employee", name, f"No employee with the ID '{name}' was found.")
+        elif problem["kind"] in ("no_employee", "unidentified"):
+            # Live: a model-invented id ("E?not_found") was echoed back; only ids the employee wrote are.
+            add("no_employee", name, UNIDENTIFIED)
         elif problem["kind"] == "seats_available":
             # Live: the model promised "you will be provisioned"; nothing is assigned by this assistant.
             add("seats_available", name,
@@ -338,6 +387,11 @@ def name_facts(state: dict) -> list[tuple[str, str]]:
                 "approves it).")
         else:
             add("not_named", name, f"The proposed system '{name}' {NOT_NAMED}.")
+    # Owner: someone not identified as an employee is told nothing about systems or seats.
+    employee = [fact for fact in facts if fact[0] == "no_employee"]
+    if employee:
+        # The generic sentence adds nothing next to a specific one.
+        return [fact for fact in employee if fact[1] != UNIDENTIFIED] or employee[:1]
     return facts
 
 
@@ -378,7 +432,15 @@ class ExactNameLookups(AgentMiddleware):
         if request.tool_call["name"] == SUBSCRIPTION_TOOL and isinstance(result, ToolMessage):
             return mark_substring_rows(result, str(request.tool_call["args"].get("software", "")))
         if request.tool_call["name"] == EMPLOYEE_TOOL and isinstance(result, ToolMessage):
-            return mark_missing_employee(result, str(request.tool_call["args"].get("query", "")))
+            query = str(request.tool_call["args"].get("query", ""))
+            flipped = reversed_name(query)
+            # The server matches a name's words in order (live: "cohen daniel" found no one).
+            if flipped and result.status != "error" and not json_rows(result):
+                retry = await handler(request.override(
+                    tool_call={**request.tool_call, "args": {**request.tool_call["args"], "query": flipped}}))
+                if isinstance(retry, ToolMessage) and retry.status != "error" and json_rows(retry):
+                    return prefixed(retry, f"No match for '{query.strip()}'; found by the name in reverse order ('{flipped}').")
+            return mark_missing_employee(result, query)
         return result
 
 
@@ -437,13 +499,14 @@ def build_graph(tools: list, model=None, checkpointer=None):
     async def worker(payload: WorkerInput) -> dict:
         name, started = payload["name"], time.perf_counter()
         trace(name, f"working ... (tools: {', '.join(WORKER_SPECS[name]['tools'])})")
-        status, summary, used, unmatched, unknown = "ok", "", 0, [], []
+        status, summary, used, unmatched, unknown, ambiguous = "ok", "", 0, [], [], []
         try:
             result = await workers[name].ainvoke(
                 {"messages": [HumanMessage(payload["request"])]}, config={"recursion_limit": 12})
             messages = result["messages"]
             unmatched = unmatched_in(messages)
             unknown = unmatched_in(messages, _NO_EMPLOYEE)
+            ambiguous = ambiguous_in(messages, payload["request"])
             results = [m for m in messages if isinstance(m, ToolMessage)]
             blocked = [m for m in results if str(m.content).startswith("Tool call limit exceeded")]
             used = len(results) - len(blocked)
@@ -461,7 +524,8 @@ def build_graph(tools: list, model=None, checkpointer=None):
         return {"findings": [Finding(agent=name, status=status, summary=summary or "No report produced.",
                                      seconds=round(seconds, 2), tool_calls=used,
                                      unmatched=list(dict.fromkeys(unmatched)),
-                                     unknown_employees=list(dict.fromkeys(unknown)))]}
+                                     unknown_employees=list(dict.fromkeys(unknown)),
+                                     ambiguous_employees=list(dict.fromkeys(ambiguous)))]}
 
     async def act(state: SupervisorState) -> dict:
         findings = state.get("findings", [])
@@ -506,13 +570,26 @@ def build_graph(tools: list, model=None, checkpointer=None):
             wanted, reasons, row = software.lower(), [], None
             # Filing accepts only an exact, case-sensitive employee id (live: "SAAS" was approved,
             # then refused by the server), so the employee must be found exactly as proposed.
-            if employee not in people:
-                people[employee] = await employee_tool.ainvoke(
-                    {"type": "tool_call", "id": f"verify-employee-{call['id']}", "name": EMPLOYEE_TOOL,
-                     "args": {"query": employee}})
-            if not any(str(r.get("employee_id")) == employee for r in json_rows(people[employee])):
+            async def find(query):
+                if query not in people:
+                    people[query] = json_rows(await employee_tool.ainvoke(
+                        {"type": "tool_call", "id": f"verify-employee-{call['id']}-{len(people)}",
+                         "name": EMPLOYEE_TOOL, "args": {"query": query}}))
+                return people[query]
+
+            person = next((r for r in await find(employee) if str(r.get("employee_id")) == employee), None)
+            if person is None:
                 reasons.append(f"no employee with the ID '{employee}' was found")
                 problems.append({"kind": "no_employee", "name": employee})
+            elif not await identified(person, state["request"], find):
+                # Live: "maya" matched two employees and the model filed for one of them.
+                # The guessed id is not shown: it would tell the requester who matched.
+                reasons.append("the request does not identify the employee exactly")
+                problems.append({"kind": "unidentified", "name": employee})
+            if reasons:
+                # Owner: no system details for a requester who is not identified as an employee.
+                failures[call["id"]] = "; ".join(reasons)
+                continue
             # The model may substitute a system the employee never named (live: an "AI" request
             # became a Webex proposal), so the name must appear in the request as a whole word.
             if not named_in(software, state["request"]):

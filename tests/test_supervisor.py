@@ -554,7 +554,7 @@ class VerifyTests(unittest.IsolatedAsyncioTestCase):
         # Live: an "AI" request became a Webex proposal (the knowledge search returned Webex articles).
         server = FakeServer()
         app = supervisor.build_graph(server.tools(), model=make_model(act=proposing("Webex")))
-        result = await start(app, "I'm E013 and AI says I'm not licensed")
+        result = await start(app, "I'm E010 and AI says I'm not licensed")
         self.assertNotIn("__interrupt__", result)
         self.assertEqual(server.writes, [])
         self.assertNotIn("check_software_subscription", [name for name, _ in server.log])
@@ -565,8 +565,8 @@ class VerifyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("never named", supervisor.outcome_of(result))
 
     async def test_t28_software_named_in_any_case_passes(self):
-        for request in ("i'm e010 and webex says I'm not licensed", "Webex: not licensed",
-                        "(WEBEX) help", "I'm E010 and WeBeX is broken"):
+        for request in ("i'm e010 and webex says I'm not licensed", "E010 - Webex: not licensed",
+                        "(WEBEX) help for E010", "I'm E010 and WeBeX is broken"):
             server = FakeServer()
             app = supervisor.build_graph(server.tools(), model=make_model(act=proposing("Webex")))
             self.assertIn("__interrupt__", await start(app, request), request)
@@ -775,11 +775,11 @@ class FixedAnswerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_t30_both_triggers_state_each_fact_once(self):
         model = make_model(workers=["records"], records=lookup_then_report("AI"), act=proposing("AI"))
-        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "I need access to AI")
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "I'm E010 and need access to AI")
         self.assertEqual(result["answer"], f"No system named exactly 'AI' was found. {NOTHING_FILED}")
 
         model = make_model(workers=["records"], records=lookup_then_report("AI"), act=proposing("Webex"))
-        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "I need access to AI")
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "I'm E010 and need access to AI")
         self.assertEqual(result["answer"], "No system named exactly 'AI' was found. "
                          f"The proposed system 'Webex' was never named in your request. {NOTHING_FILED}")
         self.assertEqual(result["answer"].count("tell us the exact name"), 1)
@@ -810,7 +810,7 @@ class FixedAnswerTests(unittest.IsolatedAsyncioTestCase):
                 # The employee wrote the hostile text (only names in the request count, T31).
                 (make_model(workers=["records"], records=lookup_then_report(hostile), act=suggesting("MailGuard")),
                  hostile),
-                (make_model(workers=["eligibility"], act=proposing(hostile)), "I need access to AI")):
+                (make_model(workers=["eligibility"], act=proposing(hostile)), "I'm E010 and need access to AI")):
             result = await start(supervisor.build_graph(FakeServer().tools(), model=model), request)
             answer = result["answer"]
             name = answer.split("'")[1]
@@ -848,11 +848,11 @@ class BusinessRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.writes, [])
         self.assertIn("No employee with the ID 'e010' was found.", result["answer"])
 
-    async def test_t31_employee_and_software_problems_are_each_stated_once(self):
+    async def test_t31_with_an_employee_problem_only_that_problem_is_stated(self):
+        # Owner: someone not identified as an employee gets no internal details about systems.
         model = make_model(act=lambda m, b: calls((WRITE, {**WEBEX_ARGS, "employee_id": "SAAS", "software": "AI"})))
         result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "SAAS needs AI")
-        self.assertEqual(result["answer"], "No employee with the ID 'SAAS' was found. "
-                         f"No system named exactly 'AI' was found. Nothing was filed. {ASK_EMPLOYEE} {ASK_NAME}")
+        self.assertEqual(result["answer"], f"No employee with the ID 'SAAS' was found. Nothing was filed. {ASK_EMPLOYEE}")
 
     async def test_t31_lookup_of_a_name_the_employee_never_wrote_is_ignored(self):
         # Live: "I'm R6001 - what SW can I get?" — records looked up "Confluence" and the fixed
@@ -877,7 +877,7 @@ class BusinessRuleTests(unittest.IsolatedAsyncioTestCase):
                              "For new emploee (E099) - create access request for all the corporate SW ")
         self.assertEqual(next(f for f in result["findings"] if f["agent"] == "records")["status"], "incomplete")
         self.assertEqual(server.writes, [])
-        self.assertEqual(result["answer"], f"No employee with the ID 'E099' was found. Nothing was filed. {ASK_EMPLOYEE}")
+        self.assertEqual(result["answer"], f"No employee matching 'E099' was found. Nothing was filed. {ASK_EMPLOYEE}")
 
     async def test_t31_employee_lookups_that_find_someone_or_were_never_asked_are_ignored(self):
         for query, request in (("E010", "I'm E010, what SW can I get?"),
@@ -959,6 +959,133 @@ class BulkRequestTests(unittest.IsolatedAsyncioTestCase):
         field = supervisor.Plan.model_fields["bulk"]
         self.assertIs(field.default, False)
         self.assertIn("more than one employee", field.description)
+
+
+# ── T33: the request must identify the employee ─────────────────────────────────
+
+UNIDENTIFIED = f"Your request does not identify the employee exactly. Nothing was filed. {ASK_EMPLOYEE}"
+MAYA_REQUEST = ("For emploee maya from novaops.com  - create access requests for webex and other utils - "
+                "Salesforce, HubS")
+
+
+def filing_for(employee_id):
+    return make_model(act=lambda m, b: calls((WRITE, {**WEBEX_ARGS, "employee_id": employee_id})))
+
+
+class EmployeeIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_t33_first_name_shared_by_two_employees_is_never_filed(self):
+        # Live: "maya" matches Maya Cohen (E001) and Maya Rosen (E020); E001 was approved and filed.
+        server, model = FakeServer(), filing_for("E001")
+        result = await start(supervisor.build_graph(server.tools(), model=model), MAYA_REQUEST)
+        self.assertNotIn("__interrupt__", result)
+        self.assertEqual(server.writes, [])
+        self.assertEqual(result["answer"], UNIDENTIFIED)
+        self.assertNotIn("respond", model.roles())
+
+    async def test_t33_id_email_or_unique_full_name_identifies_the_employee(self):
+        for request in ("I'm E001 and Webex says I'm not licensed",
+                        "maya.cohen@novaops.example needs Webex",
+                        "For Maya Cohen - create an access request for webex"):
+            result = await start(supervisor.build_graph(FakeServer().tools(), model=filing_for("E001")), request)
+            self.assertIn("__interrupt__", result, request)
+
+    async def test_t33_unidentified_employee_gets_no_internal_details(self):
+        # Live: "For emploee COHEN from novaops.com …" — the reply gave Salesforce's seat counts and
+        # the outcome line named the employee id the model guessed.
+        model = make_model(act=lambda m, b: calls((WRITE, {**WEBEX_ARGS, "employee_id": "E001", "software": "MailGuard"}),
+                                                  (WRITE, {**WEBEX_ARGS, "employee_id": "E001"})))
+        server = FakeServer()
+        result = await start(supervisor.build_graph(server.tools(), model=model),
+                             "For emploee COHEN  from novaops.com  - create access requests for webex and MailGuard")
+        self.assertEqual(result["answer"], UNIDENTIFIED)
+        # The CLI prints the outcome line to the requester too.
+        self.assertEqual(supervisor.outcome_of(result), "not filed — the request does not identify the employee exactly.")
+        self.assertNotIn("check_software_subscription", [name for name, _ in server.log])
+
+    async def test_t33_unknown_employee_from_a_lookup_hides_software_facts(self):
+        model = make_model(workers=["records"], records=lambda m, b: (
+            text("Records: done.") if saw_tool_result(m) else
+            calls(("get_employee", {"query": "E099"}), ("check_software_subscription", {"software": "AI"}))),
+            act=lambda m, b: text("E099 may use MailGuard."))
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "E099 needs AI")
+        self.assertEqual(result["answer"], f"No employee matching 'E099' was found. Nothing was filed. {ASK_EMPLOYEE}")
+
+    async def test_t33_lookup_matching_several_employees_never_lists_them(self):
+        # Live: nothing was proposed and the reply said "two employees named Maya on record: Maya
+        # Cohen and Maya Rosen" to a requester who had not been identified.
+        def looking_up(query):
+            return lambda m, b: text("Records: done.") if saw_tool_result(m) else calls(("get_employee", {"query": query}))
+
+        model = make_model(workers=["records"], records=looking_up("maya"),
+                           act=lambda m, b: text("There are two Mayas: Maya Cohen and Maya Rosen."))
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), MAYA_REQUEST)
+        self.assertEqual(result["answer"], UNIDENTIFIED)
+        for request in ("I'm Maya Cohen, what SW can I get?", "I'm E001 (maya), what SW can I get?"):
+            model = make_model(workers=["records"], records=looking_up("Maya"),
+                               act=lambda m, b: text("Here is what you can get."))
+            result = await start(supervisor.build_graph(FakeServer().tools(), model=model), request)
+            self.assertEqual(result["answer"], "Here is what you can get.", request)
+
+    async def test_t33_full_name_shared_by_two_employees_is_not_enough(self):
+        server = FakeServer(extra_employees={"E030": ("Maya Cohen", "Analyst")})
+        result = await start(supervisor.build_graph(server.tools(), model=filing_for("E001")),
+                             "For Maya Cohen - create an access request for webex")
+        self.assertNotIn("__interrupt__", result)
+        self.assertEqual(result["answer"], UNIDENTIFIED)
+
+
+# ── T34: names in either order; over the seat limit is the reason to file ────────
+
+DANIEL_REVERSED = "For emploee cohen daniel - create access requests for tools like webex "
+
+
+def employee_lookups(*queries):
+    """A records specialist that looks each query up, then reports what it saw."""
+    def reply(messages, bound):
+        seen = [m for m in messages if isinstance(m, ToolMessage)]
+        if len(seen) < len(queries):
+            return calls(("get_employee", {"query": queries[len(seen)]}))
+        return text("Records: " + " | ".join(str(m.content) for m in seen))
+    return reply
+
+
+class NameOrderAndSeatRuleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_t34_a_name_in_reverse_order_finds_the_employee(self):
+        # Live: "cohen daniel" found no one (the server matches the words in order), and the
+        # reply said a real employee (E017 Daniel Cohen) does not exist.
+        model = make_model(workers=["records"], records=employee_lookups("cohen daniel"),
+                           act=lambda m, b: text("Daniel Cohen may use Webex."))
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), DANIEL_REVERSED)
+        finding = result["findings"][0]
+        self.assertIn("E017", finding["summary"])
+        self.assertEqual(finding["unknown_employees"], [])
+        self.assertEqual(result["answer"], "Daniel Cohen may use Webex.")
+
+    async def test_t34_a_full_name_in_reverse_order_identifies_the_employee(self):
+        model = make_model(act=lambda m, b: calls((WRITE, {**WEBEX_ARGS, "employee_id": "E017"})))
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), DANIEL_REVERSED)
+        self.assertIn("__interrupt__", result)
+
+    async def test_t34_a_name_found_by_no_one_is_not_called_an_id(self):
+        # Live: "No employee with the ID 'cohen daniel' was found. No employee with the ID
+        # 'E?notfound' was found." — a name called an id, and a model-invented id echoed back.
+        model = make_model(records=employee_lookups("zed zulu"),
+                           act=lambda m, b: calls((WRITE, {**WEBEX_ARGS, "employee_id": "E?not_found"})))
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model),
+                             "For emploee zed zulu - create access requests for tools like webex")
+        self.assertEqual(result["answer"], f"No employee matching 'zed zulu' was found. Nothing was filed. {ASK_EMPLOYEE}")
+
+    async def test_t34_an_invented_id_is_never_echoed(self):
+        model = make_model(act=lambda m, b: calls((WRITE, {**WEBEX_ARGS, "employee_id": "E?not_found"})))
+        result = await start(supervisor.build_graph(FakeServer().tools(), model=model), "Webex for my colleague please")
+        self.assertEqual(result["answer"], UNIDENTIFIED)
+
+    def test_t34_prompts_say_over_the_seat_limit_is_the_reason_to_file(self):
+        # Live: "Webex is at its seat limit, so I cannot file a request for you" (nothing proposed),
+        # and after a rejection: "not filed because the subscription is over capacity".
+        for prompt in (supervisor.ACT_PROMPT, supervisor.RESPOND_PROMPT):
+            self.assertIn("being over its seat limit is the reason a request is filed, never a reason "
+                          "it cannot be", prompt)
 
 
 if __name__ == "__main__":
